@@ -22,7 +22,7 @@
     </div>
 
     <!-- ereader -->
-    <component v-if="readerComponentName" ref="readerComponent" :is="readerComponentName" :url="ebookUrl" :library-item="selectedLibraryItem" :is-local="isLocal" :keep-progress="keepProgress" :showing-toolbar="showingToolbar" @touchstart="touchstart" @touchend="touchend" @loaded="readerLoaded" @hook:mounted="readerMounted" />
+    <component v-if="readerComponentName" ref="readerComponent" :is="readerComponentName" :url="ebookUrl" :library-item="selectedLibraryItem" :is-local="isLocal" :keep-progress="keepProgress" :showing-toolbar="showingToolbar" @touchstart="touchstart" @touchend="touchend" @loaded="readerLoaded" @flow-resolved="onFlowResolved" @hook:mounted="readerMounted" />
 
     <!-- table of contents modal -->
     <modals-fullscreen-modal v-model="showTOCModal" :theme="ereaderTheme">
@@ -94,7 +94,8 @@
               </div>
               <ui-range-input v-model="ereaderSettings.textStroke" :min="0" :max="300" :step="5" input-width="180px" @input="settingsUpdated" />
             </div>
-            <div class="flex items-center mb-6">
+            <ui-dropdown v-model="ereaderSettings.flow" :items="flowItems" :label="$strings.LabelFlow" class="mb-6" @input="settingsUpdated" />
+            <div v-if="ereaderSettings.flow === 'paginated'" class="flex items-center mb-6">
               <div class="w-32">
                 <p class="text-sm">{{ $strings.LabelLayout }}</p>
               </div>
@@ -154,7 +155,8 @@ export default {
         textStroke: 0,
         navigateWithVolume: 'enabled',
         navigateWithVolumeWhilePlaying: false,
-        keepScreenAwake: false
+        keepScreenAwake: false,
+        flow: null
       }
     }
   },
@@ -215,6 +217,22 @@ export default {
         {
           text: this.$strings.LabelLayoutAuto,
           value: 'auto'
+        }
+      ]
+    },
+    flowItems() {
+      return [
+        {
+          text: this.$strings.LabelFlowPaginated,
+          value: 'paginated'
+        },
+        {
+          text: this.$strings.LabelFlowScrolledContinuous,
+          value: 'scrolled-continuous'
+        },
+        {
+          text: this.$strings.LabelFlowScrolledDoc,
+          value: 'scrolled-doc'
         }
       ]
     },
@@ -344,9 +362,14 @@ export default {
     }
   },
   methods: {
+    onFlowResolved(flow) {
+      this.ereaderSettings.flow = flow
+    },
     settingsUpdated() {
       this.$refs.readerComponent?.updateSettings?.(this.ereaderSettings)
-      localStorage.setItem('ereaderSettings', JSON.stringify(this.ereaderSettings))
+
+      // Reading flow is per book, so it is not saved
+      localStorage.setItem('ereaderSettings', JSON.stringify({ ...this.ereaderSettings, flow: undefined }))
 
       this.initWatchVolume()
       this.initKeepScreenAwake()

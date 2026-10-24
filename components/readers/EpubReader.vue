@@ -13,6 +13,10 @@
 <script>
 import ePub from 'epubjs'
 
+const EPUB_FLOWS = ['paginated', 'scrolled-continuous', 'scrolled-doc']
+// Used when the epub does not set rendition:flow
+const DEFAULT_FLOW = 'scrolled-doc'
+
 export default {
   props: {
     url: String,
@@ -29,6 +33,11 @@ export default {
       book: null,
       /** @type {ePub.Rendition} */
       rendition: null,
+      /** Flow the current rendition was created with */
+      currentFlow: null,
+      /** Width and height offset the rendition was last sized with, used to skip status bar resizes */
+      renditionWidth: null,
+      renditionHeightOffset: null,
       progress: 0,
       totalLocations: 0,
       currentLocationNum: 0,
@@ -40,7 +49,8 @@ export default {
         font: 'serif',
         fontScale: 100,
         lineSpacing: 115,
-        textStroke: 0
+        textStroke: 0,
+        flow: null
       }
     }
   },
@@ -74,7 +84,7 @@ export default {
       return this.$store.getters['getIsPlayerOpen']
     },
     readerHeightOffset() {
-      return this.isPlayerOpen ? 204 : 104
+      return this.isPlayerOpen ? 204 : 64
     },
     /** @returns {Array<ePub.NavItem>} */
     chapters() {
@@ -131,12 +141,13 @@ export default {
 
       if (!this.rendition) return
 
-      this.applyTheme()
+      if (settings.flow && settings.flow !== this.currentFlow) {
+        this.setFlow(settings.flow)
+        return
+      }
 
-      const fontScale = settings.fontScale || 100
-      this.rendition.themes.fontSize(`${fontScale}%`)
-      this.rendition.themes.font(settings.font)
-      this.rendition.spread(settings.spread || 'auto')
+      this.applyTheme()
+      this.applyDisplaySettings()
     },
     goToChapter(href) {
       return this.rendition?.display(href)
@@ -319,52 +330,18 @@ export default {
         requestMethod: this.isLocal ? null : customRequest
       })
 
-      /** @type {ePub.Rendition} */
-      reader.rendition = reader.book.renderTo('viewer', {
-        width: window.innerWidth,
-        height: window.innerHeight - this.readerHeightOffset,
-        snap: true,
-        manager: 'continuous',
-        flow: 'paginated'
-      })
-
       reader.book.ready.then(() => {
         console.log('%c [EpubReader] Book ready', 'color:cyan;')
+
+        // The flow decides the rendition's manager, so the rendition can only be created once the book's metadata is known
+        const epubFlow = this.getEpubFlow()
+        this.$emit('flow-resolved', epubFlow)
+        this.createRendition(epubFlow)
 
         let displayCfi = reader.book.locations.start
         if (this.savedEbookLocation && reader.book.spine.get(this.savedEbookLocation)) {
           displayCfi = this.savedEbookLocation
         }
-
-        reader.rendition.on('displayed', async () => {
-          console.log('%c [EpubReader] Rendition displayed', 'color:blue;')
-
-          // Overriding the needsSnap function in epubjs `snap.js` to fix a bug with scrollLeft being a decimal
-          reader.rendition.manager.snapper.needsSnap = function () {
-            let left = Math.round(this.scrollLeft)
-            let snapWidth = this.layout.pageWidth * this.layout.divisor
-            return left % snapWidth !== 0
-          }
-        })
-
-        reader.rendition.on('rendered', (section, view) => {
-          this.applyTheme()
-          console.log('%c [EpubReader] Rendition rendered', 'color:red;', section, view)
-        })
-
-        // set up event listeners
-        reader.rendition.on('relocated', reader.relocated)
-
-        reader.rendition.on('displayError', (err) => {
-          console.log('[EpubReader] Display error', err)
-        })
-
-        reader.rendition.on('touchstart', (event) => {
-          this.$emit('touchstart', event)
-        })
-        reader.rendition.on('touchend', (event) => {
-          this.$emit('touchend', event)
-        })
 
         // load ebook cfi locations
         const savedLocations = this.loadLocations()
@@ -388,6 +365,88 @@ export default {
           })
         })
       })
+    },
+    /** @returns {string} flow set by the epub (rendition:flow), or the default if it is missing or unknown */
+    getEpubFlow() {
+      const flow = this.book?.packaging?.metadata?.flow
+      return EPUB_FLOWS.includes(flow) ? flow : DEFAULT_FLOW
+    },
+    /** @param {string} flow */
+    createRendition(flow) {
+      /** @type {ePub.Rendition} */
+      const rendition = this.book.renderTo('viewer', {
+        width: window.innerWidth,
+        height: window.innerHeight - this.readerHeightOffset,
+        // Snapping only applies to paginated
+        snap: flow === 'paginated',
+        // scrolled-doc renders one section at a time, the continuous manager stacks sections
+        manager: flow === 'scrolled-doc' ? 'default' : 'continuous',
+        flow
+      })
+      this.rendition = rendition
+      this.currentFlow = flow
+      this.renditionWidth = window.innerWidth
+      this.renditionHeightOffset = this.readerHeightOffset
+
+      rendition.on('displayed', async () => {
+        console.log('%c [EpubReader] Rendition displayed', 'color:blue;')
+
+        // Overriding the needsSnap function in epubjs `snap.js` to fix a bug with scrollLeft being a decimal
+        const snapper = rendition.manager.snapper
+        if (snapper) {
+          snapper.needsSnap = function () {
+            let left = Math.round(this.scrollLeft)
+            let snapWidth = this.layout.pageWidth * this.layout.divisor
+            return left % snapWidth !== 0
+          }
+        }
+      })
+
+      rendition.on('rendered', (section, view) => {
+        this.applyTheme()
+        console.log('%c [EpubReader] Rendition rendered', 'color:red;', section, view)
+      })
+
+      // set up event listeners
+      rendition.on('relocated', this.relocated)
+
+      rendition.on('displayError', (err) => {
+        console.log('[EpubReader] Display error', err)
+      })
+
+      rendition.on('touchstart', (event) => {
+        this.$emit('touchstart', event)
+      })
+      rendition.on('touchend', (event) => {
+        this.$emit('touchend', event)
+      })
+
+      this.applyDisplaySettings()
+    },
+    /** @param {string} flow */
+    setFlow(flow) {
+      if (flow === this.currentFlow) return
+      console.log(`[EpubReader] Changing flow from ${this.currentFlow} to ${flow}`)
+
+      // Changing the manager needs a new rendition. Stay on the current location
+      this.inittingDisplay = true
+      const cfi = this.currentLocationCfi
+      this.rendition.destroy()
+      document.getElementById('viewer').innerHTML = ''
+
+      this.createRendition(flow)
+      this.rendition.display(cfi).then(() => {
+        this.inittingDisplay = false
+      })
+    },
+    applyDisplaySettings() {
+      const fontScale = this.ereaderSettings.fontScale || 100
+      this.rendition.themes.fontSize(`${fontScale}%`)
+      this.rendition.themes.font(this.ereaderSettings.font)
+
+      if (this.currentFlow === 'paginated') {
+        this.rendition.spread(this.ereaderSettings.spread || 'auto')
+      }
     },
     applyTheme() {
       if (!this.rendition) return
@@ -415,9 +474,14 @@ export default {
       this.isRefreshingUI = false
     },
     refreshUI() {
-      if (this.rendition?.resize) {
-        this.rendition.resize(window.innerWidth, window.innerHeight - this.readerHeightOffset)
-      }
+      if (!this.rendition?.resize) return
+
+      // Showing or hiding the status bar changes innerHeight but not the layout. Resizing then rebuilds the views and jumps the scroll position, so only resize for width or player changes
+      if (window.innerWidth === this.renditionWidth && this.readerHeightOffset === this.renditionHeightOffset) return
+
+      this.renditionWidth = window.innerWidth
+      this.renditionHeightOffset = this.readerHeightOffset
+      this.rendition.resize(window.innerWidth, window.innerHeight - this.readerHeightOffset)
     }
   },
   mounted() {
