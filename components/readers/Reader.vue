@@ -227,12 +227,8 @@ export default {
           value: 'paginated'
         },
         {
-          text: this.$strings.LabelFlowScrolledContinuous,
-          value: 'scrolled-continuous'
-        },
-        {
-          text: this.$strings.LabelFlowScrolledDoc,
-          value: 'scrolled-doc'
+          text: this.$strings.LabelFlowScrolled,
+          value: 'scrolled'
         }
       ]
     },

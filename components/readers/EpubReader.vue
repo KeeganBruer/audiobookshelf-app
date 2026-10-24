@@ -13,9 +13,8 @@
 <script>
 import ePub from 'epubjs'
 
-const EPUB_FLOWS = ['paginated', 'scrolled-continuous', 'scrolled-doc']
 // Used when the epub does not set rendition:flow
-const DEFAULT_FLOW = 'scrolled-doc'
+const DEFAULT_FLOW = 'scrolled'
 
 export default {
   props: {
@@ -369,7 +368,10 @@ export default {
     /** @returns {string} flow set by the epub (rendition:flow), or the default if it is missing or unknown */
     getEpubFlow() {
       const flow = this.book?.packaging?.metadata?.flow
-      return EPUB_FLOWS.includes(flow) ? flow : DEFAULT_FLOW
+      if (flow === 'paginated') return 'paginated'
+      // scrolled-doc and scrolled-continuous are both shown as scrolled
+      if (flow === 'scrolled-doc' || flow === 'scrolled-continuous') return 'scrolled'
+      return DEFAULT_FLOW
     },
     /** @param {string} flow */
     createRendition(flow) {
@@ -379,9 +381,8 @@ export default {
         height: window.innerHeight - this.readerHeightOffset,
         // Snapping only applies to paginated
         snap: flow === 'paginated',
-        // scrolled-doc renders one section at a time, the continuous manager stacks sections
-        manager: flow === 'scrolled-doc' ? 'default' : 'continuous',
-        flow
+        manager: flow === 'scrolled' ? 'default' : 'continuous',
+        flow: flow === 'scrolled' ? 'scrolled-doc' : flow
       })
       this.rendition = rendition
       this.currentFlow = flow
