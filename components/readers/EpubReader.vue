@@ -1,6 +1,13 @@
 <template>
   <div id="epub-frame" class="w-full">
-    <div id="viewer" class="h-full w-full"></div>
+    <div id="viewer" class="h-full w-full" :style="pullViewerStyle"></div>
+
+    <div v-if="pullEdge && pullCanNavigate" class="fixed left-0 w-full flex flex-col items-center pointer-events-none" :style="pullIndicatorStyle">
+      <p class="text-xs bg-black/60 text-white px-3 py-1 rounded">{{ pullArmed ? $strings.LabelHoldToContinue : pullEdge === 'end' ? $strings.LabelPullForNextChapter : $strings.LabelPullForPreviousChapter }}</p>
+      <div v-if="pullArmed" class="mt-1 w-32 h-1 bg-white/30 rounded overflow-hidden">
+        <div class="pull-progress h-full bg-white" />
+      </div>
+    </div>
 
     <div class="fixed left-0 h-8 w-full px-4 flex items-center" :class="isLightTheme ? 'bg-white text-black' : isDarkTheme ? 'bg-[#232323] text-white/80' : 'bg-black text-white/80'" :style="{ bottom: isPlayerOpen ? '120px' : '0px' }">
       <p v-if="totalLocations" class="text-xs text-slate-600">Location {{ currentLocationNum }} of {{ totalLocations }}</p>
@@ -15,6 +22,12 @@ import ePub from 'epubjs'
 
 // Used when the epub does not set rendition:flow
 const DEFAULT_FLOW = 'scrolled'
+
+// Overscroll at the end or start of a chapter in scrolled mode
+const PULL_ARM_DISTANCE = 140 // px pulled past the edge before the hold starts
+const PULL_HOLD_MS = 500 // keep holding this long to change chapter. The pull-progress animation in the style block uses the same duration
+const PULL_RESISTANCE = 0.5 // how far the content moves per px of pull
+const PULL_MAX_OFFSET = 120 // max px the content moves
 
 export default {
   props: {
@@ -32,11 +45,18 @@ export default {
       book: null,
       /** @type {ePub.Rendition} */
       rendition: null,
-      /** Flow the current rendition was created with */
       currentFlow: null,
-      /** Width and height offset the rendition was last sized with, used to skip status bar resizes */
       renditionWidth: null,
       renditionHeightOffset: null,
+      pullEdge: null,
+      pullStartY: null,
+      pullTouchStartY: null,
+      pullTriggered: false,
+      pullCanNavigate: false,
+      pullActive: false,
+      pullArmed: false,
+      pullOffset: 0,
+      pullHoldTimeout: null,
       progress: 0,
       totalLocations: 0,
       currentLocationNum: 0,
@@ -114,6 +134,17 @@ export default {
     },
     isDarkTheme() {
       return this.ereaderSettings.theme === 'dark'
+    },
+    pullViewerStyle() {
+      return {
+        transform: `translateY(${this.pullOffset}px)`,
+        // Springs back when the finger lifts, follows the finger while pulling
+        transition: this.pullActive ? 'none' : 'transform 0.25s ease-out'
+      }
+    },
+    pullIndicatorStyle() {
+      if (this.pullEdge === 'end') return { bottom: this.isPlayerOpen ? '152px' : '40px' }
+      return { top: '40px' }
     },
     themeRules() {
       const isDark = this.ereaderSettings.theme === 'dark'
@@ -416,10 +447,19 @@ export default {
       })
 
       rendition.on('touchstart', (event) => {
+        this.resetScrolledPull()
+        this.pullTouchStartY = event.touches[0].screenY
         this.$emit('touchstart', event)
       })
+      rendition.on('touchmove', (event) => {
+        this.handleScrolledPull(event)
+      })
       rendition.on('touchend', (event) => {
+        this.resetScrolledPull()
         this.$emit('touchend', event)
+      })
+      rendition.hooks.content.register((contents) => {
+        contents.document.addEventListener('touchcancel', this.resetScrolledPull, { passive: true })
       })
 
       this.applyDisplaySettings()
@@ -432,6 +472,7 @@ export default {
       // Changing the manager needs a new rendition. Stay on the current location
       this.inittingDisplay = true
       const cfi = this.currentLocationCfi
+      this.resetScrolledPull()
       this.rendition.destroy()
       document.getElementById('viewer').innerHTML = ''
 
@@ -439,6 +480,83 @@ export default {
       this.rendition.display(cfi).then(() => {
         this.inittingDisplay = false
       })
+    },
+    /** @param {TouchEvent} e - touchmove from inside the book */
+    handleScrolledPull(e) {
+      const container = this.rendition?.manager?.container
+      if (!container || this.currentFlow !== 'scrolled' || this.pullTriggered) return
+
+      // screenY, because the iframe moves with the content while pulling
+      const y = e.touches[0].screenY
+      const atEnd = container.scrollTop + container.clientHeight >= container.scrollHeight - 1
+      const atStart = container.scrollTop <= 0
+      let edge = null
+      if (atEnd && atStart) edge = y < this.pullTouchStartY ? 'end' : 'start'
+      else if (atEnd) edge = 'end'
+      else if (atStart) edge = 'start'
+
+      // A pull only counts from the moment the reader is already at an edge, so normal scrolling is unaffected
+      if (edge !== this.pullEdge) {
+        this.pullEdge = edge
+        this.pullStartY = y
+      }
+      if (!edge) {
+        this.clearPullHold()
+        this.pullOffset = 0
+        this.pullActive = false
+        return
+      }
+
+      this.pullActive = true
+      this.pullCanNavigate = this.hasSection(edge)
+
+      const distance = Math.max(edge === 'end' ? this.pullStartY - y : y - this.pullStartY, 0)
+      const offset = Math.min(distance * PULL_RESISTANCE, PULL_MAX_OFFSET)
+      this.pullOffset = edge === 'end' ? -offset : offset
+
+      if (distance < PULL_ARM_DISTANCE || !this.pullCanNavigate) {
+        this.clearPullHold()
+        return
+      }
+
+      if (!this.pullArmed) {
+        this.pullArmed = true
+        this.pullHoldTimeout = setTimeout(() => this.completePull(edge), PULL_HOLD_MS)
+      }
+    },
+    /** @param {'start' | 'end'} edge */
+    hasSection(edge) {
+      const index = this.rendition?.currentLocation()?.start?.index
+      if (index === undefined || !this.book) return false
+      return edge === 'end' ? index < this.book.spine.length - 1 : index > 0
+    },
+    /** @param {'start' | 'end'} edge */
+    completePull(edge) {
+      this.pullHoldTimeout = null
+      this.pullArmed = false
+      if (!this.rendition) return
+
+      this.pullTriggered = true
+      const navigation = edge === 'end' ? this.rendition.next() : this.rendition.prev()
+      // Spring back over the new chapter once it has rendered
+      Promise.resolve(navigation).finally(() => this.resetPullVisuals())
+    },
+    clearPullHold() {
+      clearTimeout(this.pullHoldTimeout)
+      this.pullHoldTimeout = null
+      this.pullArmed = false
+    },
+    resetPullVisuals() {
+      this.clearPullHold()
+      this.pullOffset = 0
+      this.pullActive = false
+      this.pullEdge = null
+      this.pullStartY = null
+      this.pullCanNavigate = false
+    },
+    resetScrolledPull() {
+      this.resetPullVisuals()
+      this.pullTriggered = false
     },
     applyDisplaySettings() {
       const fontScale = this.ereaderSettings.fontScale || 100
@@ -497,6 +615,7 @@ export default {
     window.addEventListener('resize', this.screenOrientationChange)
   },
   beforeDestroy() {
+    this.clearPullHold()
     this.book?.destroy()
 
     if (screen.orientation) {
@@ -520,5 +639,17 @@ export default {
   height: calc(100% - 132px);
   max-height: calc(100% - 132px);
   overflow: hidden;
+}
+
+.pull-progress {
+  animation: pull-fill 500ms linear forwards;
+}
+@keyframes pull-fill {
+  from {
+    width: 0;
+  }
+  to {
+    width: 100%;
+  }
 }
 </style>
